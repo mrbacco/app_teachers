@@ -161,6 +161,10 @@ Feb 23, 2026
         <h2>Weekly Sessions</h2>
         <form method="post" action="{{ url_for('run_allocation') }}" class="alloc-form">
           <button type="submit">Auto Allocate</button>
+          <label class="check-label">
+            <input type="checkbox" name="replace_locked" value="1" />
+            Also replace locked cells
+          </label>
           <span class="meta">Unassigned: {{ unassigned_count }}</span>
         </form>
       </div>
@@ -229,9 +233,18 @@ Feb 23, 2026
                               </select>
                             </label>
 
+                            <label class="check-label" title="Locked cells keep their teacher when Auto Allocate runs">
+                              <input type="checkbox" name="is_locked" value="1" data-lock-toggle {% if cell.is_locked %}checked{% endif %} />
+                              Lock
+                            </label>
+
                             <p class="assigned-status {% if cell.assigned_teacher_name %}filled{% endif %}">
-                              Assigned: {{ cell.assigned_teacher_name if cell.assigned_teacher_name else 'Unassigned' }}
+                              Assigned: {{ cell.assigned_teacher_name if cell.assigned_teacher_name else 'Unassigned' }}{% if cell.is_locked %} (locked){% endif %}
                             </p>
+
+                            {% if cell.assignment_problem %}
+                              <p class="cell-warning">{{ cell.assigned_teacher_name }} {{ cell.assignment_problem }}.</p>
+                            {% endif %}
 
                             <button type="submit" {% if skills|length == 0 %}disabled{% endif %}>Save</button>
                           </form>
@@ -285,6 +298,18 @@ Feb 23, 2026
       if (initialDay) {
         activateDay(initialDay);
       }
+
+      // Picking a teacher by hand locks the cell by default; clearing the teacher unlocks it.
+      document.querySelectorAll(".cell-form").forEach((form) => {
+        const teacherSelect = form.querySelector("select[name='assigned_teacher_id']");
+        const lockToggle = form.querySelector("[data-lock-toggle]");
+        if (!teacherSelect || !lockToggle) {
+          return;
+        }
+        teacherSelect.addEventListener("change", function () {
+          lockToggle.checked = teacherSelect.value !== "";
+        });
+      });
     })();
   </script>
 </body>

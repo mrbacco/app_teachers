@@ -11,6 +11,8 @@
   --ok-ink: #1f6b32;
   --err-bg: #fff2f2;
   --err-ink: #8a1f1f;
+  --warn-bg: #fff8e6;
+  --warn-ink: #7a5300;
 }
 
 * {
@@ -62,6 +64,11 @@ body {
 .flash.error {
   background: var(--err-bg);
   color: var(--err-ink);
+}
+
+.flash.warning {
+  background: var(--warn-bg);
+  color: var(--warn-ink);
 }
 
 .layout {
@@ -350,6 +357,29 @@ button.danger:hover {
   border-style: solid;
   border-color: #b7cfe8;
   background: #eef5fd;
+}
+
+.cell-warning {
+  margin: 0;
+  font-size: 12px;
+  color: var(--warn-ink);
+  background: var(--warn-bg);
+  border: 1px solid #f0d9a0;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.check-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.check-label input {
+  width: auto;
+  margin: 0;
 }
 
 .cell-clear-form {

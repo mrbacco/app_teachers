@@ -118,8 +118,10 @@ class Session(db.Model):
     assigned_teacher_id = db.Column(db.Integer, db.ForeignKey("teachers.id", ondelete="SET NULL"), nullable=True)
     day = db.Column(db.String(20), nullable=True)
     year_group = db.Column(db.String(20), nullable=True)
+    # Locked cells keep their teacher when auto-allocation runs.
+    is_locked = db.Column(db.Boolean, nullable=False, default=False, server_default="0")
 
-    required_skill = db.relationship("Skill", back_populates="required_sessions", foreign_keys=[required_skill_id])
+    required_skill =db.relationship("Skill", back_populates="required_sessions", foreign_keys=[required_skill_id])
     assigned_teacher = db.relationship("Teacher", back_populates="assigned_sessions", foreign_keys=[assigned_teacher_id])
 
 
@@ -130,8 +132,9 @@ def migrate_legacy_year_groups() -> None:
             {Session.year_group: new_value},
             synchronize_session=False,
         )
+    # Always commit: even a zero-row UPDATE opens a write transaction that would block later bootstrap steps.
+    db.session.commit()
     if migrated:
-        db.session.commit()
         BAC_LOG.info("step=bootstrap.migration migrated_year_groups=%s", migrated)
 
 
@@ -290,6 +293,9 @@ def ensure_session_grid_columns() -> None:
         if "year_group" not in columns:
             conn.exec_driver_sql("ALTER TABLE sessions ADD COLUMN year_group VARCHAR(20)")
             BAC_LOG.info("step=bootstrap.migration added_column=sessions.year_group")
+        if "is_locked" not in columns:
+            conn.exec_driver_sql("ALTER TABLE sessions ADD COLUMN is_locked BOOLEAN NOT NULL DEFAULT 0")
+            BAC_LOG.info("step=bootstrap.migration added_column=sessions.is_locked")
 
 
 def split_csv(text: str) -> list[str]:
@@ -405,66 +411,140 @@ def get_or_create_grid_cell_session(day: str, slot: str, year_group: str, requir
     return primary, deduped
 
 
-def allocate_sessions() -> None:
+def assignment_issue(teacher: Teacher, session: Session, tokens: set[str] | None = None, skill_ids: set[int] | None = None) -> str | None:
+    """Return why `teacher` cannot take `session`, or None if the assignment is valid."""
+    if tokens is None:
+        tokens = teacher_slot_tokens(teacher)
+    if skill_ids is None:
+        skill_ids = {skill.id for skill in teacher.skills}
+    if session.required_skill_id not in skill_ids:
+        skill_name = session.required_skill.name if session.required_skill else "the required skill"
+        return f"does not teach {skill_name}"
+    if not teacher_is_available_for_slot(tokens, session.day, session.slot):
+        return "is not free at this time"
+    return None
+
+
+def describe_cell(session: Session) -> str:
+    return f"{session.day} {session.slot} {session.year_group}"
+
+
+def match_teachers_to_sessions(sessions: list[Session], candidates: dict[int, list[int]]) -> dict[int, int]:
+    """Maximum bipartite matching (augmenting paths) for one period; returns session_id -> teacher_id.
+
+    Candidate lists are in preference order, so ties go to the teachers listed first.
+    """
+    holder_of_teacher: dict[int, Session] = {}
+
+    def try_assign(session: Session, visited: set[int]) -> bool:
+        for teacher_id in candidates[session.id]:
+            if teacher_id in visited:
+                continue
+            visited.add(teacher_id)
+            holder = holder_of_teacher.get(teacher_id)
+            if holder is None or try_assign(holder, visited):
+                holder_of_teacher[teacher_id] = session
+                return True
+        return False
+
+    # Hardest-to-fill sessions first so they get first pick of the preferred teachers.
+    for session in sorted(sessions, key=lambda item: len(candidates[item.id])):
+        try_assign(session, set())
+
+    return {session.id: teacher_id for teacher_id, session in holder_of_teacher.items()}
+
+
+def allocate_sessions(replace_locked: bool = False) -> dict[str, int]:
     teacher_rows = Teacher.query.order_by(Teacher.name.asc()).all()
     session_rows = grid_sessions_query().all()
-    BAC_LOG.info("step=allocate.start teachers=%s sessions=%s", len(teacher_rows), len(session_rows))
+    BAC_LOG.info("step=allocate.start teachers=%s sessions=%s replace_locked=%s", len(teacher_rows), len(session_rows), replace_locked)
 
-    day_order = {day: idx for idx, day in enumerate(WEEK_DAYS)}
-    slot_order = {slot: idx for idx, slot in enumerate(TEACHING_SLOTS)}
-    year_order = {year: idx for idx, year in enumerate(YEAR_GROUPS)}
-    session_rows.sort(key=lambda item: (day_order[item.day], slot_order[item.slot], year_order[item.year_group]))
-
+    teacher_by_id = {teacher.id: teacher for teacher in teacher_rows}
     teacher_tokens = {teacher.id: teacher_slot_tokens(teacher) for teacher in teacher_rows}
     teacher_skill_ids = {teacher.id: {skill.id for skill in teacher.skills} for teacher in teacher_rows}
-    busy_at_slot: dict[tuple[str, str], set[int]] = defaultdict(set)
     assigned_count: dict[int, int] = {teacher.id: 0 for teacher in teacher_rows}
 
+    sessions_by_period: dict[tuple[str, str], list[Session]] = defaultdict(list)
+    kept_locked = 0
+    dropped_locks = 0
+
     for session in session_rows:
+        sessions_by_period[(session.day, session.slot)].append(session)
+        teacher = teacher_by_id.get(session.assigned_teacher_id)
+        if session.is_locked and not replace_locked and teacher is not None:
+            issue = assignment_issue(teacher, session, teacher_tokens[teacher.id], teacher_skill_ids[teacher.id])
+            if issue is None:
+                kept_locked += 1
+                assigned_count[teacher.id] += 1
+                continue
+            dropped_locks += 1
+            BAC_LOG.warning("step=allocate.lock_dropped session_id=%s teacher_id=%s reason=%r", session.id, teacher.id, issue)
         session.assigned_teacher_id = None
+        session.is_locked = False
+
+    # Write the cleared cells first so new assignments cannot trip the one-teacher-per-period index mid-flush.
+    db.session.flush()
 
     assigned = 0
     unassigned = 0
+    day_order = {day: idx for idx, day in enumerate(WEEK_DAYS)}
+    slot_order = {slot: idx for idx, slot in enumerate(TEACHING_SLOTS)}
 
-    for session in session_rows:
-        matches: list[Teacher] = []
-        for teacher in teacher_rows:
-            if session.required_skill_id not in teacher_skill_ids.get(teacher.id, set()):
-                continue
-            if not teacher_is_available_for_slot(teacher_tokens.get(teacher.id, set()), session.day, session.slot):
-                continue
-            if teacher.id in busy_at_slot[(session.day, session.slot)]:
-                continue
-            matches.append(teacher)
+    for day, slot in sorted(sessions_by_period, key=lambda key: (day_order[key[0]], slot_order[key[1]])):
+        period_sessions = sessions_by_period[(day, slot)]
+        busy = {session.assigned_teacher_id for session in period_sessions if session.assigned_teacher_id}
+        open_sessions = [session for session in period_sessions if not session.assigned_teacher_id]
+        if not open_sessions:
+            continue
 
-        if not matches:
-            unassigned += 1
+        # Teachers with lighter loads so far are preferred, which spreads work across the week.
+        ranked_teachers = sorted(
+            (teacher for teacher in teacher_rows if teacher.id not in busy),
+            key=lambda teacher: (assigned_count[teacher.id], teacher.name.lower()),
+        )
+        candidates = {
+            session.id: [
+                teacher.id
+                for teacher in ranked_teachers
+                if assignment_issue(teacher, session, teacher_tokens[teacher.id], teacher_skill_ids[teacher.id]) is None
+            ]
+            for session in open_sessions
+        }
+
+        matching = match_teachers_to_sessions(open_sessions, candidates)
+        for session in open_sessions:
+            teacher_id = matching.get(session.id)
+            if teacher_id is None:
+                unassigned += 1
+                BAC_LOG.info(
+                    "step=allocate.unassigned session_id=%s day=%s slot=%s year_group=%s",
+                    session.id,
+                    session.day,
+                    session.slot,
+                    session.year_group,
+                )
+                continue
+            session.assigned_teacher_id = teacher_id
+            assigned_count[teacher_id] += 1
+            assigned += 1
             BAC_LOG.info(
-                "step=allocate.unassigned session_id=%s day=%s slot=%s year_group=%s",
+                "step=allocate.assigned session_id=%s teacher_id=%s day=%s slot=%s year_group=%s",
                 session.id,
+                teacher_id,
                 session.day,
                 session.slot,
                 session.year_group,
             )
-            continue
-
-        matches.sort(key=lambda teacher: (assigned_count[teacher.id], teacher.name.lower()))
-        selected = matches[0]
-        session.assigned_teacher_id = selected.id
-        busy_at_slot[(session.day, session.slot)].add(selected.id)
-        assigned_count[selected.id] += 1
-        assigned += 1
-        BAC_LOG.info(
-            "step=allocate.assigned session_id=%s teacher_id=%s day=%s slot=%s year_group=%s",
-            session.id,
-            selected.id,
-            session.day,
-            session.slot,
-            session.year_group,
-        )
 
     db.session.commit()
-    BAC_LOG.info("step=allocate.complete assigned=%s unassigned=%s", assigned, unassigned)
+    BAC_LOG.info(
+        "step=allocate.complete assigned=%s unassigned=%s kept_locked=%s dropped_locks=%s",
+        assigned,
+        unassigned,
+        kept_locked,
+        dropped_locks,
+    )
+    return {"assigned": assigned, "unassigned": unassigned, "kept_locked": kept_locked, "dropped_locks": dropped_locks}
 
 
 def build_schedule(teachers: list[Teacher], sessions: list[Session]) -> dict[str, list[dict]]:
@@ -497,6 +577,14 @@ def build_schedule(teachers: list[Teacher], sessions: list[Session]) -> dict[str
                 existing = session_lookup.get((day, slot, year_group))
                 current_teacher_id = existing.assigned_teacher_id if existing else None
                 required_skill_id = existing.required_skill_id if existing else None
+                assignment_problem = None
+                if existing and existing.assigned_teacher:
+                    assignment_problem = assignment_issue(
+                        existing.assigned_teacher,
+                        existing,
+                        teacher_tokens.get(current_teacher_id),
+                        teacher_skill_ids.get(current_teacher_id),
+                    )
 
                 teacher_options = []
                 for teacher in teachers:
@@ -529,6 +617,8 @@ def build_schedule(teachers: list[Teacher], sessions: list[Session]) -> dict[str
                         "required_skill_id": required_skill_id,
                         "assigned_teacher_id": current_teacher_id,
                         "assigned_teacher_name": existing.assigned_teacher.name if existing and existing.assigned_teacher else None,
+                        "is_locked": bool(existing and existing.is_locked and current_teacher_id),
+                        "assignment_problem": assignment_problem,
                         "teacher_options": teacher_options,
                     }
                 )
@@ -837,9 +927,26 @@ def update_teacher(teacher_id: int):
     teacher.name = name
     teacher.free_slots = free_slots
     teacher.skills = Skill.query.filter(Skill.id.in_(skill_ids)).all() if skill_ids else []
+
+    # Drop any existing assignments the new skills/availability no longer allow.
+    released: list[str] = []
+    for session in grid_sessions_query().filter(Session.assigned_teacher_id == teacher.id).all():
+        issue = assignment_issue(teacher, session)
+        if issue is None:
+            continue
+        session.assigned_teacher_id = None
+        session.is_locked = False
+        released.append(f"{describe_cell(session)} ({issue})")
+        BAC_LOG.warning("step=teachers.update.released_session teacher_id=%s session_id=%s reason=%r", teacher_id, session.id, issue)
+
     db.session.commit()
-    BAC_LOG.info("step=teachers.update.success teacher_id=%s", teacher_id)
+    BAC_LOG.info("step=teachers.update.success teacher_id=%s released_sessions=%s", teacher_id, len(released))
     flash("Teacher updated.", "success")
+    if released:
+        flash(
+            f"{teacher.name} was removed from {len(released)} class(es) they can no longer take: " + "; ".join(released),
+            "warning",
+        )
     return redirect(url_for("index"))
 
 
@@ -863,14 +970,16 @@ def save_grid_session():
     year_group = (request.form.get("year_group", "") or "").strip()
     required_skill_id = request.form.get("required_skill_id", type=int)
     assigned_teacher_id = request.form.get("assigned_teacher_id", type=int)
+    is_locked = request.form.get("is_locked") == "1"
 
     BAC_LOG.info(
-        "step=sessions.grid.save.request day=%r slot=%r year_group=%r skill_id=%r teacher_id=%r",
+        "step=sessions.grid.save.request day=%r slot=%r year_group=%r skill_id=%r teacher_id=%r is_locked=%s",
         day,
         slot,
         year_group,
         required_skill_id,
         assigned_teacher_id,
+        is_locked,
     )
 
     if day not in WEEK_DAYS or slot not in TEACHING_SLOTS or year_group not in YEAR_GROUPS:
@@ -920,8 +1029,10 @@ def save_grid_session():
             return redirect(url_for("index", active_day=active_day))
 
         session.assigned_teacher_id = teacher.id
+        session.is_locked = is_locked
     else:
         session.assigned_teacher_id = None
+        session.is_locked = False
 
     db.session.commit()
     BAC_LOG.info("step=sessions.grid.save.success session_id=%s", session.id)
@@ -960,9 +1071,20 @@ def run_allocation():
         flash("No sessions to allocate.", "error")
         return redirect(url_for("index"))
 
-    allocate_sessions()
+    replace_locked = request.form.get("replace_locked") == "1"
+    result = allocate_sessions(replace_locked=replace_locked)
     BAC_LOG.info("step=allocate.success")
-    flash("Allocation completed.", "success")
+
+    message = f"Allocation completed. Assigned {result['assigned']}"
+    if result["kept_locked"]:
+        message += f", kept {result['kept_locked']} locked"
+    message += f", {result['unassigned']} still unassigned."
+    flash(message, "success" if result["unassigned"] == 0 else "warning")
+    if result["dropped_locks"]:
+        flash(
+            f"{result['dropped_locks']} locked cell(s) were unlocked and re-allocated because their teacher no longer has the skill or free time.",
+            "warning",
+        )
     return redirect(url_for("index"))
 
 
